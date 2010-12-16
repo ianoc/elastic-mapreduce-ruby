@@ -27,9 +27,11 @@ class ElasticMapReduceClient
   #   construct requests, hand them off to the orchestrator, and receive responses in return.
   def initialize(orchestrator)
     @addJobFlowStepsDispatcher = Dispatcher.new(orchestrator, 'ElasticMapReduce', 'AddJobFlowSteps')
+    @addInstanceGroupsDispatcher = Dispatcher.new(orchestrator, 'ElasticMapReduce', 'AddInstanceGroups')
     @terminateJobFlowsDispatcher = Dispatcher.new(orchestrator, 'ElasticMapReduce', 'TerminateJobFlows')
     @describeJobFlowsDispatcher = Dispatcher.new(orchestrator, 'ElasticMapReduce', 'DescribeJobFlows')
     @runJobFlowDispatcher = Dispatcher.new(orchestrator, 'ElasticMapReduce', 'RunJobFlow')
+    @modifyInstanceGroupsDispatcher = Dispatcher.new(orchestrator, 'ElasticMapReduce', 'ModifyInstanceGroups')
   end
 
 
@@ -48,6 +50,23 @@ class ElasticMapReduceClient
   #
   def newAddJobFlowStepsCall
     Call.new(@addJobFlowStepsDispatcher)
+  end
+
+  #
+  # Instantiates a call object to invoke the AddInstanceGroups operation:
+  #
+  # Example usage:
+  #   my_call = my_client.newAddInstanceGroupsCall
+  #   # set identity information if needed
+  #   my_call.identity[:aws_access_key] = my_access_key
+  #   my_call.identity[:aws_secret_key] = my_secret_key
+  #   # make the remote call
+  #   my_call.call(my_input)
+  #   # retrieve the request-id returned by the server
+  #   my_request_id = my_call.request_id
+  #
+  def newAddInstanceGroupsCall
+    Call.new(@addInstanceGroupsDispatcher)
   end
 
   #
@@ -101,6 +120,10 @@ class ElasticMapReduceClient
     Call.new(@runJobFlowDispatcher)
   end
 
+  def newModifyInstanceGroupsCall
+    Call.new(@modifyInstanceGroupsDispatcher)
+  end
+
 
   #
   # Shorthand method to invoke the AddJobFlowSteps operation:
@@ -110,6 +133,16 @@ class ElasticMapReduceClient
   #
   def AddJobFlowSteps(input = {})
     newAddJobFlowStepsCall.call(input)
+  end
+  
+  #
+  # Shorthand method to invoke the AddInstanceGroups operation:
+  #
+  # Example usage:
+  #   my_client.AddInstanceGroups(my_input)
+  #
+  def AddInstanceGroups(input = {})
+    newAddInstanceGroupsCall.call(input)
   end
 
   #
@@ -143,6 +176,11 @@ class ElasticMapReduceClient
   end
 
 
+  def ModifyInstanceGroups(input = {})
+    newModifyInstanceGroupsCall.call(input)
+  end
+
+
   # Instantiates the client with an orchestrator configured for use with AWS/QUERY.
   # Use of this constructor is deprecated in favor of using the AwsQuery class:
   #   client = ElasticMapReduceClient.new(AwsQuery.new_orchestrator(args))
@@ -157,9 +195,12 @@ end
 # allow running from the command line
 Service.new(:service => 'ElasticMapReduce', :operations => [
   'AddJobFlowSteps',
+  'AddInstanceGroups',
   'TerminateJobFlows',
   'DescribeJobFlows',
-  'RunJobFlow']).main if caller.empty?
+  'RunJobFlow',
+  'ModifyInstanceGroups'
+  ]).main if caller.empty?
 
 end
 end

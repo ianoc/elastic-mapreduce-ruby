@@ -19,3 +19,24 @@
   installing a particular version of Hive.
   
 * Added support for streaming arguments of Hadoop 0.20 (-files, -archives, -D).
+
+== 2010-09-16 Support for fetching files from EMR
+
+* Added --get option to scp from files EMR. Added symmetric --put option that 
+  behaves exactly like --scp.
+
+== 2010-10-19 Added support for resizing running job flows. 
+
+* Added new arguments for resizing running job flows --add-instance-group, 
+  --modify-instance-group, and --unarrest-instance-group.
+
+* Added a new step for resizing a job flow at a particular point.
+
+* Substantially reworked processing arguments to be more consistent and unit testable.
+
+== 2010-11-11 Bug fixes
+
+* Fixed processing of Pig and Hive script commands to allow
+  --hive-script CMD and --hive-script --args CMD as well 
+
+* Fixed processing of --main-class
