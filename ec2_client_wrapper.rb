@@ -60,6 +60,19 @@ class Ec2ClientWrapper
     return raise_on_error(result)
   end
 
+  def add_tags(instance_id, tags)
+    logger.trace "CreateTags('InstanceId' => #{instance_id.inspect}, 'tags' => #{tags.inspect}"
+    args_map = {}
+    tag_indx = 1
+    tags.each do |k, v|
+        args_map["ResourceId.#{tag_indx}"] = instance_id
+        args_map["Tag.#{tag_indx}.Value"] = v
+        args_map["Tag.#{tag_indx}.Key"] = k 
+        tag_indx += 1
+    end
+    result = @client.CreateTags(args_map)
+  end
+
   def associate_address(instance_id, public_ip)
     logger.trace "AssociateAddress('InstanceId' => #{instance_id.inspect}, 'PublicIp' => #{public_ip.inspect})"
     result = @client.AssociateAddress('InstanceId' => instance_id, 'PublicIp' => public_ip)
