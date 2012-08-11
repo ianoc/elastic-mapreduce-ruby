@@ -75,7 +75,7 @@ module Amazon
       # example usage:
       #   my_client.createtags(my_input)
       def CreateTags(input = {})
-        newcreatetagscall.call(input)
+        newCreateTagsCall.call(input)
       end
 
       # shorthand method to invoke the describetags operation:
@@ -83,7 +83,7 @@ module Amazon
       # example usage:
       #   my_client.describetags(my_input)
       def DescribeTags(input = {})
-        newdescribetagscall.call(input)
+        newDescribeTagsCall.call(input)
       end
 
       # Shorthand method to invoke the AssociateAddress operation:
