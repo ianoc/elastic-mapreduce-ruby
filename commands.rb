@@ -1,11 +1,16 @@
+#
+# Copyright 2008-2010 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+
 require 'set'
 require 'credentials'
 require 'optparse'
 require 'client'
+require 'ec2_client_wrapper'
+require 'open3'
 
 module Commands
 
-  ELASTIC_MAPREDUCE_CLIENT_VERSION = "2010-11-11"
+  ELASTIC_MAPREDUCE_CLIENT_VERSION = "2012-07-31"
 
   class Commands
     attr_accessor :opts, :global_options, :commands, :logger, :executor
@@ -339,7 +344,25 @@ module Commands
     end
   end
 
-  class PigScriptCommand < StepCommand
+  class PigCommand < StepCommand
+    attr_accessor :pig_versions
+
+    def get_version_args(require_single_version)
+      versions = get_field(:pig_versions, nil)
+      if versions == nil then
+        # Pass latest by default. 
+        return ["--pig-versions", "latest"]
+      end
+      if require_single_version then
+        if versions.split(",").size != 1 then
+          raise RuntimeError, "Only one version my be specified for --pig-script"
+        end
+      end
+      return ["--pig-versions", versions]
+    end
+  end
+  
+  class PigScriptCommand < PigCommand
     def steps
       mandatory_args = [ "--run-pig-script", "--args", "-f" ]
       if @arg then
@@ -350,7 +373,7 @@ module Commands
         "ActionOnFailure" => get_field(:step_action, "CANCEL_AND_WAIT"),
         "HadoopJarStep"   => {
           "Jar" => get_field(:script_runner_path),
-          "Args" => get_field(:pig_cmd) + mandatory_args + @args
+          "Args" => get_field(:pig_cmd) + get_version_args(true) + mandatory_args + @args
         }
       }
       return [ step ]
@@ -362,7 +385,7 @@ module Commands
     end
   end
 
-  class PigInteractiveCommand < StepCommand
+  class PigInteractiveCommand < PigCommand
     def self.new_from_commands(commands, parent)
       sc = self.new("--pig-interactive", "Run a jobflow with Pig Installed", nil, commands)
       sc.step_action = parent.step_action
@@ -375,7 +398,8 @@ module Commands
         "ActionOnFailure" => get_field(:step_action, "TERMINATE_JOB_FLOW"),
         "HadoopJarStep"   => {
           "Jar" => get_field(:script_runner_path),
-          "Args" => get_field(:pig_cmd) + ["--install-pig"] + extra_args
+          "Args" => get_field(:pig_cmd) + ["--install-pig"] + extra_args +
+          get_version_args(false)
         }
       }
       return [ step ]  
@@ -391,13 +415,243 @@ module Commands
     end
   end
 
+  #
+  # Script Command
+  #
+
+  class ScriptCommand < StepCommand
+
+    attr_accessor :script
+    
+    def steps
+      step = {
+        "Name"            => get_field(:step_name, "Run Hive Script"),
+        "ActionOnFailure" => get_field(:step_action, "CANCEL_AND_WAIT"),
+        "HadoopJarStep"   => {
+          "Jar" => get_field(:script_runner_path),
+          "Args" => [ get_field(:arg) ] + @args
+        }
+      }
+      [ step ]
+    end
+  end
+
+  #
+  # HBase Commands
+  #
+  class HBaseCommand < Command
+    attr_accessor :hbase_jar_path, :install_script, :backup_dir, :backup_version, :consistent
+    attr_accessor :apps_path
+
+    def initialize(*args)
+      super(*args)
+    end
+
+    def hbase_jar_path
+      "/home/hadoop/lib/hbase-0.92.0.jar"      
+    end
+
+    def install_script
+      File.join(get_field(:apps_path), "bootstrap-actions/setup-hbase")
+    end
+
+    def get_step_args(cmd, cmd_arg=nil)
+      args = [ "emr.hbase.backup.Main", cmd ] 
+      if cmd_arg != nil then
+        args << cmd_arg
+      end
+      if get_field(:backup_dir, nil) then
+        args += [ "--backup-dir", get_field(:backup_dir) ]
+      end
+      if get_field(:backup_version, nil) then
+        args += [ "--backup-version", get_field(:backup_version) ]
+      end 
+      if get_field(:consistent, nil) then
+        args += [ "--consistent" ]
+      end 
+      return args
+    end
+
+    def reorder_steps(jobflow, sc)
+      return sc
+    end
+  end
+
+  class HBaseInstall < HBaseCommand
+
+    INVALID_INSTANCE_TYPES = Set.new(%w(m1.small c1.medium))
+
+    def modify_jobflow(jobflow)
+      jobflow["Instances"]["TerminationProtected"] = "true"
+      jobflow["Instances"]["KeepJobFlowAliveWhenNoSteps"] = "true"
+      for group in jobflow["Instances"]["InstanceGroups"] do
+        instance_type = group["InstanceType"]
+        if ! is_valid_instance_type(instance_type) then
+          raise "Instance type #{instance_type} is not compatible with HBase, try adding --instance-type m1.large"
+        end
+      end
+      if ! is_valid_ami_version(jobflow["AmiVersion"]) then
+        raise "Ami version #{jobflow["AmiVersion"]} is not compatible with HBase"
+      end
+    end
+
+    def is_valid_ami_version(ami_version)
+      ami_version == "latest" || ami_version >= "2.1"
+    end
+
+    def is_valid_instance_type(instance_type)
+      return ! INVALID_INSTANCE_TYPES.member?(instance_type)
+    end
+
+    def bootstrap_actions(index)
+      action = {
+        "Name" => get_field(:bootstrap_name, "Install HBase"),
+        "ScriptBootstrapAction" => {
+          "Path" => get_field(:install_script),
+          "Args" => []
+        }
+      }
+      return [ action ]
+    end
+
+    def steps
+      step = {
+        "Name"            => get_field(:step_name, "Start HBase"),
+        "ActionOnFailure" => get_field(:step_action, "CANCEL_AND_WAIT"),
+        "HadoopJarStep"   => {
+          "Jar" => get_field(:hbase_jar_path),
+          "Args" => [ "emr.hbase.backup.Main", "--start-master" ] 
+        }
+      }
+      return [step]
+    end
+
+  end
+
+  class HBaseBackup < HBaseCommand
+
+    def initialize(*args)
+      super(*args)
+    end
+
+    def steps
+      step = {
+        "Name"            => get_field(:step_name, "Backup HBase"),
+        "ActionOnFailure" => get_field(:step_action, "CANCEL_AND_WAIT"),
+        "HadoopJarStep"   => {
+          "Jar" => get_field(:hbase_jar_path),
+          "Args" => get_step_args("--backup")
+        }
+      }
+      return [step]
+    end
+  end
+
+  class HBaseRestore < HBaseCommand
+
+    def initialize(*args)
+      super(*args)
+    end
+
+    def steps
+      step = {
+        "Name"            => get_field(:step_name, "Restore HBase"),
+        "ActionOnFailure" => get_field(:step_action, "CANCEL_AND_WAIT"),
+        "HadoopJarStep"   => {
+          "Jar" => get_field(:hbase_jar_path),
+          "Args" => get_step_args("--restore")
+        }
+      }
+      return [step]
+    end
+
+    def reorder_steps(jobflow, sc)
+      new_sc = []
+      for cmd in sc do
+        if ! cmd.is_a?(HBaseRestore) then
+          new_sc << cmd
+        end
+      end
+      return [ self ] + new_sc
+    end
+
+  end
+
+  class HBaseBackupSchedule < HBaseCommand
+
+    attr_accessor :full_backup_time_interval, :full_backup_time_unit, :backup_dir
+    attr_accessor :start_time, :disable_full_backups, :disable
+    attr_accessor :incremental_time_interval, :incremental_time_unit
+    attr_accessor :disable_incremental_backups
+    
+    def initialize(*args)
+      super(*args)
+    end
+
+    def validate
+      super
+      unless get_field(:disable_full_backups, false) || get_field(:disable_incremental_backups, false) then
+        require(:backup_dir,    "--backup-dir path must be defined")
+      end
+    end
+
+    def isDisable
+      disable = get_field(:disable_full_backups, false) || get_field(:disable_incremental_backups, false)
+      return disable
+    end
+    
+    def steps
+      args = get_step_args("--set-scheduled-backup", isDisable ? "false" : "true")
+      if get_field(:full_backup_time_interval, nil) then
+        args += ["--full-backup-time-interval", get_field(:full_backup_time_interval, nil)]
+      end
+      if get_field(:full_backup_time_unit, nil) then
+        args += ["--full-backup-time-unit", get_field(:full_backup_time_unit, nil)]
+      end
+      if get_field(:start_time, "now") then
+        args += ["--start-time", get_field(:start_time, "now")]
+        if get_field(:start_time, "now") == "now" then
+          puts "Setting StartTime for periodic backups to now, since you did not specify start-time"
+        end
+      end
+      if get_field(:incremental_time_interval, nil) then
+        args += ["--incremental-backup-time-interval", get_field(:incremental_time_interval, nil)]
+      end
+      if get_field(:incremental_time_unit, nil) then
+        args += ["--incremental-backup-time-unit", get_field(:incremental_time_unit, nil)]
+      end
+      if isDisable then
+        if get_field(:disable_full_backups) then
+          args += ["--disable-full-backups"]
+        end
+        if get_field(:disable_incremental_backups) then
+          args += ["--disable-incremental-backups"]
+        end
+      end
+      
+      step = {
+        "Name"            => get_field(:step_name, "Modify Backup Schedule"),
+        "ActionOnFailure" => get_field(:step_action, "CANCEL_AND_WAIT"),
+        "HadoopJarStep"   => {
+          "Jar" => get_field(:hbase_jar_path),
+          "Args" => args
+        }
+      }
+      return [step]
+    end
+  end
+
+  #
+  # Hive Commands
+  #
+
   class HiveCommand < StepCommand
     attr_accessor :hive_versions
     
     def get_version_args(require_single_version)
       versions = get_field(:hive_versions, nil)
       if versions == nil then
-        return []
+        return ["--hive-versions", "latest"]
       end
       if require_single_version then
         if versions.split(",").size != 1 then
@@ -509,7 +763,19 @@ module Commands
 
     GENERIC_OPTIONS = Set.new(%w(-conf -D -fs -jt -files -libjars -archives))
 
-    def steps
+    def initialize(*args)
+      super(*args)
+      @jobconf = []
+    end
+
+    def steps    
+      if get_field(:input) == nil ||
+         get_field(:output) == nil ||
+         get_field(:mapper) == nil ||
+         get_field(:reducer) == nil then
+        raise RuntimeError, "Missing arguments for --stream option"  
+      end 
+      
       timestr = Time.now.strftime("%Y-%m-%dT%H%M%S")
       stream_options = []
       for ca in get_field(:cache, []) do
@@ -522,8 +788,8 @@ module Commands
       
       for jc in get_field(:jobconf, []) do
         stream_options << "-jobconf" << jc
-      end
-
+      end        
+         
       # Note that the streaming options should go before command options for
       # Hadoop 0.20
       step = {
@@ -532,10 +798,10 @@ module Commands
         "HadoopJarStep"   => {
           "Jar" => "/home/hadoop/contrib/streaming/hadoop-streaming.jar",
           "Args" => (sort_streaming_args(get_field(:args))) + (stream_options) + [
-            "-input",     get_field(:input, "s3n://elasticmapreduce/samples/wordcount/input"),
-            "-output",    get_field(:output, "hdfs:///examples/output/#{timestr}"),
-            "-mapper",    get_field(:mapper, "s3n://elasticmapreduce/samples/wordcount/wordSplitter.py"),
-            "-reducer",   get_field(:reducer, "aggregate")
+            "-input",     get_field(:input),
+            "-output",    get_field(:output),
+            "-mapper",    get_field(:mapper),
+            "-reducer",   get_field(:reducer)
           ]
         }
       }
@@ -565,9 +831,28 @@ module Commands
 
   class AbstractSSHCommand < Command
     attr_accessor :no_wait, :dest, :hostname, :key_pair_file, :jobflow_id, :jobflow_detail
+    attr_accessor :cmd, :ssh_opts, :scp_opts
 
     CLOSED_DOWN_STATES        = Set.new(%w(TERMINATED SHUTTING_DOWN COMPLETED FAILED))
     WAITING_OR_RUNNING_STATES = Set.new(%w(WAITING RUNNING))
+
+    def initialize(*args)
+      super(*args)
+      @ssh_opts = ["-o ServerAliveInterval=10", "-o StrictHostKeyChecking=no"]
+      @scp_opts = ["-r", "-o StrictHostKeyChecking=no"]
+    end  
+
+    def opts
+      (get_field(:ssh_opts, []) + get_field(:scp_opts, [])).join(" ")
+    end
+
+    def get_ssh_opts
+      get_field(:ssh_opts, []).join(" ")
+    end
+
+    def get_scp_opts
+      get_field(:scp_opts, []).join(" ")
+    end
 
     def exec(cmd)
       commands.exec(cmd)
@@ -579,7 +864,7 @@ module Commands
         if WAITING_OR_RUNNING_STATES.include?(state) then
           break
         elsif CLOSED_DOWN_STATES.include?(state) then
-          raise RuntimeError, "Jobflow flow entered #{state} while waiting to ssh"
+          raise RuntimeError, "Jobflow entered #{state} while waiting to ssh"
         else
           logger.info("Jobflow is in state #{state}, waiting....")
           sleep(30)
@@ -600,7 +885,7 @@ module Commands
   end
 
   class SSHCommand < AbstractSSHCommand
-    attr_accessor :cmd
+    attr_accessor :cmd, :ssh_opts, :scp_opts
     
     def initialize(*args)
       super(*args)
@@ -613,32 +898,70 @@ module Commands
 
     def enact(client)
       super(client)
-      exec "ssh -i #{key_pair_file} hadoop@#{hostname} #{get_field(:cmd, "")}"
+      exec "ssh #{get_ssh_opts} -i #{key_pair_file} hadoop@#{hostname} #{get_field(:cmd, "")}"
     end
   end
 
   class PutCommand < AbstractSSHCommand
+    attr_accessor :scp_opts
+    
+    def initialize(*args)
+      super(*args)
+    end
+    
     def enact(client)
       super(client)
       if get_field(:dest) then
-        exec "scp -i #{key_pair_file} #{@arg} hadoop@#{hostname}:#{get_field(:dest)}"
+        exec "scp #{get_scp_opts} -i #{key_pair_file} #{@arg} hadoop@#{hostname}:#{get_field(:dest)}"
       else
-        exec "scp -i #{key_pair_file} #{@arg} hadoop@#{hostname}:#{File.basename(@arg)}"
+        exec "scp #{get_scp_opts} -i #{key_pair_file} #{@arg} hadoop@#{hostname}:#{File.basename(@arg)}"
       end
     end
   end
 
   class GetCommand < AbstractSSHCommand
+    attr_accessor :scp_opts
+    
+    def initialize(*args)
+      super(*args)
+    end
+    
     def enact(client)
       super(client)
       if get_field(:dest) then
-        exec "scp -i #{key_pair_file} hadoop@#{hostname}:#{@arg} #{get_field(:dest)}"
+        exec "scp #{self.get_scp_opts} -i #{key_pair_file} hadoop@#{hostname}:#{@arg} #{get_field(:dest)}"
       else
-        exec "scp -i #{key_pair_file} hadoop@#{hostname}:#{@arg} #{File.basename(@arg)}"
+        exec "scp #{self.get_scp_opts} -i #{key_pair_file} hadoop@#{hostname}:#{@arg} #{File.basename(@arg)}"
       end
     end
   end
 
+  class SocksCommand < AbstractSSHCommand
+    def enact(client)
+      super(client)
+      exec "ssh #{self.get_ssh_opts} -i #{key_pair_file} -ND 8157 hadoop@#{hostname}"
+    end
+  end
+
+  class PrintHiveVersionCommand < AbstractSSHCommand
+    def enact(client)
+      super(client)
+      stdin, stdout, stderr = Open3.popen3("ssh -i #{key_pair_file} hadoop@#{hostname} '/home/hadoop/bin/hive -version'")
+      version = stdout.readlines.join
+      err = stderr.readlines.join
+      if version.length > 0
+        puts version
+      elsif err =~ /Unrecognised option/ or err =~ /Error while determing Hive version/
+        stdin, stdout, stderr = Open3.popen3("ssh -i #{key_pair_file} hadoop@#{hostname} 'ls -l /home/hadoop/bin/hive'")
+        version = stdout.readlines.join
+        version =~ /hive-(.*)\/bin\/hive/
+        puts "Hive version " + $1
+      else
+        puts "Unable to determine Hive version"
+      end
+    end
+  end
+  
   class LogsCommand < AbstractSSHCommand
     attr_accessor :step_index
 
@@ -690,6 +1013,30 @@ module Commands
       end
     end
   end
+  
+  class WaitForStepsCommand < Command
+    attr_accessor :jobflow_id, :jobflow_detail
+    
+    def all_steps_terminated(client)
+      self.jobflow_detail = client.describe_jobflow_with_id(self.jobflow_id)
+      steps = resolve(self.jobflow_detail, "Steps")
+      
+      if steps.empty? != true && ["PENDING", "RUNNING"].include?(steps.last["ExecutionStatusDetail"]["State"])
+        logger.info("Last step #{steps.last["StepConfig"]["Name"]} is in state #{steps.last["ExecutionStatusDetail"]["State"]}, waiting....")
+        return false
+      end
+      
+      return true
+    end
+  
+    def enact(client)
+      self.jobflow_id = require_single_jobflow
+      
+      while ! all_steps_terminated(client) do
+        sleep(30)
+      end
+    end
+  end
 
   class StepProcessingCommand < Command
     attr_accessor :step_commands
@@ -732,16 +1079,20 @@ module Commands
   end
 
   class CreateJobFlowCommand < StepProcessingCommand
-    attr_accessor :jobflow_name, :alive, :instance_count, :slave_instance_type, 
-      :master_instance_type, :key_pair, :key_pair_file, :log_uri, :az, :ainfo,
+    attr_accessor :jobflow_name, :alive, :with_termination_protection, :instance_count, :slave_instance_type, 
+      :master_instance_type, :key_pair, :key_pair_file, :log_uri, :az, :ainfo, :ami_version, :with_supported_products,
       :hadoop_version, :plain_output, :instance_type,
-      :instance_group_commands, :bootstrap_commands
+      :instance_group_commands, :bootstrap_commands, :subnet_id
 
 
     OLD_OPTIONS = [:instance_count, :slave_instance_type, :master_instance_type]
     # FIXME: add code to setup collapse instance group commands
 
-    DEFAULT_HADOOP_VERSION = "0.20"
+    def default_hadoop_version
+      if get_field(:ami_version) == "1.0" then
+        "0.20"     
+      end
+    end
 
     def initialize(*args)
       super(*args)
@@ -772,9 +1123,6 @@ module Commands
         cmd.validate
       end
 
-      if ! have(:hadoop_version) then
-        @hadoop_version = DEFAULT_HADOOP_VERSION
-      end
     end
 
     def enact(client)
@@ -785,18 +1133,43 @@ module Commands
       apply_jobflow_option(:hadoop_version, "Instances", "HadoopVersion")
       apply_jobflow_option(:az, "Instances", "Placement", "AvailabilityZone")
       apply_jobflow_option(:log_uri, "LogUri")
+      apply_jobflow_option(:ami_version, "AmiVersion")
+      apply_jobflow_option(:subnet_id, "Instances", "Ec2SubnetId")
+ 
+      @jobflow["AmiVersion"] ||= "latest"
 
       self.step_commands = reorder_steps(@jobflow, self.step_commands)
       @jobflow["Steps"] = step_commands.map { |x| x.steps }.flatten
 
       setup_instance_groups
       @jobflow["Instances"]["InstanceGroups"] = instance_group_commands.map { |x| x.instance_group }
-
       bootstrap_action_index = 1
+      if @jobflow["SupportedProducts"] then
+        for product in @jobflow["SupportedProducts"] do
+          if product[0..4] == 'mapr-' then
+            action = {
+              "Name" => "Install " + product,
+              "ScriptBootstrapAction" => {
+                "Path" => File.join(get_field(:apps_path), "thirdparty/mapr/scripts/mapr_emr_install.sh"),
+                "Args" => ["--base-path", File.join(get_field(:apps_path), "thirdparty/mapr")]
+              }
+            }
+            @jobflow["BootstrapActions"] << action
+            bootstrap_action_index += 1
+            break
+          end
+        end
+      end
+
       for bootstrap_action_command in bootstrap_commands do
-        @jobflow["BootstrapActions"] << bootstrap_action_command.bootstrap_action(
-          bootstrap_action_index)
-        bootstrap_action_index += 1
+        if bootstrap_action_command.respond_to?(:modify_jobflow) then
+          bootstrap_action_command.modify_jobflow(@jobflow)
+        end
+        actions = bootstrap_action_command.bootstrap_actions(bootstrap_action_index)
+        for action in actions do
+          @jobflow["BootstrapActions"] << action
+          bootstrap_action_index += 1
+        end
       end
 
       run_result = client.run_jobflow(@jobflow)
@@ -812,7 +1185,7 @@ module Commands
 
     def apply_jobflow_option(field_symbol, *keys)
       value = get_field(field_symbol)
-      if value != nil then
+      if value != nil then 
         map = @jobflow
         for key in keys[0..-2] do
           nmap = map[key]
@@ -869,11 +1242,18 @@ module Commands
         "Name"   => get_field(:jobflow_name, default_job_flow_name),
         "Instances" => {
           "KeepJobFlowAliveWhenNoSteps" => (get_field(:alive) ? "true" : "false"),
+          "TerminationProtected"        => (get_field(:with_termination_protection) ? "true" : "false"),
           "InstanceGroups" => []
         },
         "Steps" => [],
         "BootstrapActions" => []
       }
+      products_string = get_field(:with_supported_products)
+      if products_string then
+        products = products_string.split(/,/).map { |s| s.strip }
+        @jobflow["SupportedProducts"] = products
+      end
+      @jobflow
     end
 
     def default_job_flow_name
@@ -893,7 +1273,7 @@ module Commands
       @args = []
     end
 
-    def bootstrap_action(index)
+    def bootstrap_actions(index)
       action = {
         "Name" => get_field(:bootstrap_name, "Bootstrap Action #{index}"),
         "ScriptBootstrapAction" => {
@@ -901,12 +1281,12 @@ module Commands
           "Args" => @args
         }
       }
-      return action
+      return [ action ]
     end
   end
 
   class AbstractListCommand < Command
-    attr_accessor :state, :max_results, :active, :all, :no_steps
+    attr_accessor :state, :max_results, :active, :all, :no_steps, :created_after, :created_before
 
     def enact(client)
       options = {}
@@ -917,15 +1297,17 @@ module Commands
         if get_field(:active) then
           states = %w(RUNNING SHUTTING_DOWN STARTING WAITING BOOTSTRAPPING)
         end
-        if get_field(:states) then
-          states += get_field(states)
+        if get_field(:state) then
+          states << get_field(:state)
         end
-        if get_field(:active) || get_field(:states) then
-          options = { 'JobFlowStates' => states }
-        elsif get_field(:all) then
-          options = { }
+
+        if get_field(:all) then
+          options = { 'CreatedAfter' => (Time.now - (58 * 24 * 3600)).xmlschema }
         else
-          options = { 'CreatedAfter' => (Time.now - (24 * 3600)).xmlschema }
+          options = {}
+          options['CreatedAfter']  = get_field(:created_after) if get_field(:created_after)
+          options['CreatedBefore'] = get_field(:created_before) if get_field(:created_before)
+          options['JobFlowStates'] = states if states.size > 0
         end
       end
       result = client.describe_jobflow(options)
@@ -979,6 +1361,15 @@ module Commands
     end
   end
 
+  class SetTerminationProtection < Command
+    def enact(client)
+      job_flow = get_field(:jobflow)
+      termination_protected = @arg == 'true'
+      client.set_termination_protection(job_flow, termination_protected)
+      logger.puts "#{termination_protected ? "Disabled":"Enabled"} job flow termination " +  job_flow.join(" ")
+    end
+  end
+  
   class TerminateActionCommand < Command
     def enact(client)
       job_flow = get_field(:jobflow)
@@ -1017,7 +1408,7 @@ module Commands
 
   class AbstractInstanceGroupCommand < Command
     attr_accessor :instance_group_id, :instance_type, :instance_role, 
-      :instance_count, :instance_group_name
+      :instance_count, :instance_group_name, :bid_price
 
     def initialize(*args)
       super(*args)
@@ -1033,13 +1424,19 @@ module Commands
     end
 
     def instance_group
-      return {
+      ig =  {
         "Name" => get_field(:instance_group_name),
-        "Market" => get_field(:instance_group_market, "ON_DEMAND"),
         "InstanceRole" => get_field(:instance_role),
         "InstanceCount" => get_field(:instance_count),
         "InstanceType"  => get_field(:instance_type)
       }
+      if get_field(:bid_price, nil) != nil
+        ig["BidPrice"] = get_field(:bid_price)
+        ig["Market"] = "SPOT"
+      else
+        ig["Market"] = "ON_DEMAND"
+      end
+      return ig
     end
 
     def require_singleton_array(arr, msg)
@@ -1201,18 +1598,23 @@ module Commands
   end
 
   class JsonStepCommand < StepCommand
-    attr_accessor :params
+    attr_accessor :variables
+
+    def initialize(*args)
+      super(*args)
+      @variables = []
+    end
 
     def steps
       content = steps = nil
-      filename = get_field(:file)
+      filename = get_field(:arg)
       begin
         content = File.read(filename)
       rescue Exception => e
         raise RuntimeError, "Couldn't read json file #{filename}"
       end
-      for var, value in get_field(:variables, []) do
-        content.gsub!(var, value)
+      for var in get_field(:variables, []) do
+        content.gsub!(var[:key], var[:value])
       end
       begin
         steps = JSON.parse(content)
@@ -1236,7 +1638,7 @@ module Commands
     def attach(commands)
       command = super(commands)
       if match = @arg.match(/([^=]+)=(.*)/) then
-        command.option(@name, @field_symbol, match[1..2])
+        command.option(@name, @field_symbol, { :key => match[1], :value => match[2] })
       else
         raise RuntimeError, "Expected '#{@arg}' to be in the form VARIABLE=VALUE"
       end
@@ -1244,12 +1646,103 @@ module Commands
     end
   end
 
+  class EipCommand < Command
+    attr_accessor :no_wait, :instance_id, :key_pair_file, :jobflow_id, :jobflow_detail
+
+    CLOSED_DOWN_STATES        = Set.new(%w(TERMINATED SHUTTING_DOWN COMPLETED FAILED))
+    WAITING_OR_RUNNING_STATES = Set.new(%w(WAITING RUNNING))
+
+    def initialize(*args)
+      super(*args)
+    end
+
+    def exec(cmd)
+      commands.exec(cmd)
+    end
+
+    def wait_for_jobflow(client)
+      while true do
+        state = resolve(self.jobflow_detail, "ExecutionStatusDetail", "State")
+        if WAITING_OR_RUNNING_STATES.include?(state) then
+          break
+        elsif CLOSED_DOWN_STATES.include?(state) then
+          raise RuntimeError, "Jobflow entered #{state} while waiting to assign Elastic IP"
+        else
+          logger.info("Jobflow is in state #{state}, waiting....")
+          sleep(30)
+          self.jobflow_detail = client.describe_jobflow_with_id(jobflow_id)
+        end
+      end
+    end
+
+    def region_from_az(az)
+      md = az.match(/((\w+-)+\d+)\w+/)
+      if md then
+        md[1]
+      else
+        raise "Unable to convert Availability Zone '#{az}' to region"
+      end
+    end
+
+    def ec2_endpoint_from_az(az)
+      return "https://ec2.#{region_from_az(az)}.amazonaws.com"      
+    end
+
+    def enact(client)
+      self.jobflow_id = require_single_jobflow
+      self.jobflow_detail = client.describe_jobflow_with_id(self.jobflow_id)
+      if ! get_field(:no_wait) then
+        wait_for_jobflow(client)
+      end
+      self.instance_id = self.jobflow_detail['Instances']['MasterInstanceId']
+      if ! self.instance_id then
+        logger.error("The master instance is not available yet for jobflow #{self.jobflow_id}. It might still be starting.")
+        exit(-1)
+      end
+
+      az = self.jobflow_detail['Instances']['Placement']['AvailabilityZone']
+
+      commands.global_options[:ec2_endpoint] = ec2_endpoint_from_az(az)
+      
+      self.key_pair_file = require(:key_pair_file, "Missing required option --key-pair-file for #{name}")
+      eip = get_field(:arg)
+
+      ec2_client = Ec2ClientWrapper.new(commands, logger)
+
+      if ! eip then
+        begin
+          response = ec2_client.allocate_address()
+        rescue Exception => e
+          logger.error("Error during AllocateAddres: " + e.message)
+          if get_field(:trace) then
+            logger.puts(e.backtrace.join("\n"))
+          end
+          exit(-1)
+        end
+
+        eip = response['publicIp']
+        logger.info("Allocated Public IP: #{eip}...")
+      end
+
+      begin
+        response = ec2_client.associate_address(self.instance_id, eip)
+        logger.info("Public IP: #{eip} was assigned to jobflow #{self.jobflow_id}")
+      rescue Exception => e
+        logger.error("Error during AssociateAddres: " + e.to_s)
+        if get_field(:trace) then
+          logger.puts(e.backtrace.join("\n"))
+        end
+        exit(-1)
+      end
+
+    end
+  end
+
   def self.add_commands(commands, opts)
-    # FIXME: add --wait-for-step function
 
     commands.opts = opts
 
-    step_commands = ["--jar", "--resize-jobflow", "--enable-debugging", "--hive-interactive", "--pig-interactive", "--hive-script", "--pig-script"]
+    step_commands = ["--jar", "--resize-jobflow", "--enable-debugging", "--hive-interactive", "--pig-interactive", "--hive-script", "--pig-script", "--hive-site", "--script"]
 
     opts.separator "\n  Creating Job Flows\n"
 
@@ -1257,16 +1750,23 @@ module Commands
     commands.parse_options(["--create"], [
       [ OptionWithArg, "--name NAME",                 "The name of the job flow being created", :jobflow_name ],
       [ FlagOption,    "--alive",                     "Create a job flow that stays running even though it has executed all its steps", :alive ],
-      [ OptionWithArg, "--num-instances NUM",             "Number of instances in the job flow", :instance_count ],
+      [ OptionWithArg, "--with-termination-protection",   "Create a job with termination protection (default is no termination protection)", :with_termination_protection ],
+      [ OptionWithArg, "--with-supported-products PRODUCTS",   "Add supported products", :with_supported_products ],
+      [ OptionWithArg, "--num-instances NUM",         "Number of instances in the job flow", :instance_count ],
       [ OptionWithArg, "--slave-instance-type TYPE",  "The type of the slave instances to launch", :slave_instance_type ],
       [ OptionWithArg, "--master-instance-type TYPE", "The type of the master instance to launch", :master_instance_type ],
+      [ OptionWithArg, "--ami-version VERSION",       "The version of ami to launch the job flow with", :ami_version ],
       [ OptionWithArg, "--key-pair KEY_PAIR",         "The name of your Amazon EC2 Keypair", :key_pair ], 
       [ OptionWithArg, "--availability-zone A_Z",     "Specify the Availability Zone in which to launch the job flow", :az ],
       [ OptionWithArg, "--info INFO",                 "Specify additional info to job flow creation", :ainfo ],
-      [ OptionWithArg, "--hadoop-version INFO",       "Specify the Hadoop Version to install", :hadoop_version ],
+      [ OptionWithArg, "--hadoop-version VERSION",    "Specify the Hadoop Version to install", :hadoop_version ],
       [ FlagOption,    "--plain-output",              "Return the job flow id from create step as simple text", :plain_output ],
+      [ OptionWithArg, "--subnet EC2-SUBNET_ID",      "Specify the VPC subnet that you want to run in", :subnet_id ],
     ])
     commands.parse_command(CreateInstanceGroupCommand, "--instance-group ROLE", "Specify an instance group while creating a jobflow")
+    commands.parse_options(["--instance-group", "--add-instance-group"], [
+      [OptionWithArg, "--bid-price PRICE",        "The bid price for this instance group", :bid_price]
+    ])
 
     opts.separator "\n  Passing arguments to steps\n"
     
@@ -1281,18 +1781,27 @@ module Commands
 
     commands.parse_command(ResizeJobflowCommand, "--resize-jobflow",     "Add a step to resize the job flow")
     commands.parse_command(EnableDebuggingCommand, "--enable-debugging", "Enable job flow debugging (you must be signed up to SimpleDB for this to work)")
+    commands.parse_command(WaitForStepsCommand, "--wait-for-steps",     "Wait for all steps to reach a terminal state")
+    commands.parse_command(ScriptCommand, "--script SCRIPT_PATH",      "Add a step that runs a script in S3")
 
     opts.separator "\n  Adding Steps from a Json File to Job Flows\n"
 
-    commands.parse_command(JsonStepCommand, "--json", "Add a sequence of steps stored in a json file")
+    commands.parse_command(JsonStepCommand, "--json FILE", "Add a sequence of steps stored in the json file FILE")
     commands.parse_options(["--json"], [
-      [ ParamOption, "--param VARIABLE=VALUE ARGS", "Substitute <variable> with value in the json file" ],
+      [ ParamOption, "--param VARIABLE=VALUE ARGS", "Substitute the string VARIABLE with the string VALUE in the json file", :variables ],
     ])
 
     opts.separator "\n  Pig Steps\n"
 
-    commands.parse_command(PigScriptCommand,      "--pig-script [SCRIPT]",  "Add a step that runs a Pig script")
-    commands.parse_command(PigInteractiveCommand, "--pig-interactive",  "Add a step that sets up the job flow for an interactive (via SSH) pig session")
+    commands.parse_command(PigScriptCommand,      "--pig-script [SCRIPT]",
+                           "Add a step that runs a Pig script")
+    commands.parse_command(PigInteractiveCommand, "--pig-interactive",
+                           "Add a step that sets up the job flow for an interactive (via SSH) pig session")
+    commands.parse_options(["--pig-script", "--pig-interactive"], [
+      [ OptionWithArg, "--pig-versions VERSIONS",
+        "A comma separated list of Pig versions", :pig_versions ],
+    ])
+
 
     opts.separator "\n  Hive Steps\n"
 
@@ -1300,7 +1809,38 @@ module Commands
     commands.parse_command(HiveInteractiveCommand, "--hive-interactive", "Add a step that sets up the job flow for an interactive (via SSH) hive session")
     commands.parse_command(HiveSiteCommand, "--hive-site HIVE_SITE", "Override Hive configuration with configuration from HIVE_SITE")
     commands.parse_options(["--hive-script", "--hive-interactive", "--hive-site"], [
-      [ OptionWithArg,     "--hive-versions VERSIONS", "A comma separated list of Hive version", :hive_versions],
+      [ OptionWithArg,     "--hive-versions VERSIONS", "A comma separated list of Hive versions", :hive_versions]
+    ])
+    
+    opts.separator "\n  HBase Options\n"
+
+    commands.parse_command(HBaseInstall,         "--hbase",                      "Install HBase on the cluster")
+    commands.parse_command(HBaseBackup,          "--hbase-backup",               "Backup HBase to S3")
+    commands.parse_command(HBaseRestore,         "--hbase-restore",              "Restore HBase from S3")
+    commands.parse_command(HBaseBackupSchedule,  "--hbase-schedule-backup",      "Schedule regular backups to S3")
+
+    commands.parse_options(["--hbase-backup", "--hbase-restore", "--hbase-schedule-backup"], [
+      [ OptionWithArg, "--backup-dir DIRECTORY", "Location where backup is stored", :backup_dir]
+    ])
+
+    commands.parse_options(["--hbase-backup", "--hbase-schedule-backup"], [
+      [ FlagOption, "--consistent", "Perform a consistent backup (inconsistent is default)", :consistent]
+    ])
+    
+    commands.parse_options(["--hbase-backup", "--hbase-restore"], [
+      [ OptionWithArg, "--backup-version VERSION", "Backup version to restore", :backup_version ]
+    ])
+    
+    commands.parse_options(["--hbase-schedule-backup"], [
+      [ OptionWithArg, "--full-backup-time-interval  TIME_INTERVAL", "The time between full backups",                :full_backup_time_interval],
+      [ OptionWithArg, "--full-backup-time-unit      TIME_UNIT",         
+                "time units for full backup's time-interval either minutes, hours or days",                          :full_backup_time_unit],
+      [ OptionWithArg, "--start-time START_TIME",       "The time of the first backup",                              :start_time],
+      [ FlagOption, "--disable-full-backups",                     "Stop scheduled full backups from running",     :disable_full_backups],
+      [ OptionWithArg, "--incremental-backup-time-interval TIME_INTERVAL", "The time between incremental backups",   :incremental_time_interval],
+      [ OptionWithArg, "--incremental-backup-time-unit TIME_UNIT", 
+                "time units for incremental backup's time-interval either minutes, hours or days",                   :incremental_time_unit],
+      [ FlagOption, "--disable-incremental-backups",       "Stop scheduled incremental backups from running",     :disable_incremental_backups],
     ])
     
     opts.separator "\n  Adding Jar Steps to Job Flows\n"
@@ -1331,32 +1871,31 @@ module Commands
     commands.parse_options(["--instance-group", "--modify-instance-group", "--add-instance-group", "--create"], [
      [ InstanceCountOption, "--instance-count INSTANCE_COUNT", "Set the instance count of an instance group", :instance_count ]
     ])
-
     commands.parse_options(["--instance-group", "--add-instance-group", "--create"], [
      [ InstanceTypeOption,  "--instance-type INSTANCE_TYPE", "Set the instance type of an instance group", :instance_type ],
     ])
-
+         
     opts.separator "\n  Contacting the Master Node\n"
-
-    commands.parse_options(["--ssh", "--scp"], [
-      [ FlagOption,    "--no-wait",    "Don't wait for the Master node to start before executing scp or ssh", :no_wait ],
-    ])
 
     commands.parse_command(SSHCommand, "--ssh [COMMAND]", "SSH to the master node and optionally run a command")
     commands.parse_command(PutCommand, "--put SRC", "Copy a file to the job flow using scp")
     commands.parse_command(GetCommand, "--get SRC", "Copy a file from the job flow using scp")
     commands.parse_command(PutCommand, "--scp SRC", "Copy a file to the job flow using scp")
-
     commands.parse_options(["--get", "--put", "--scp"], [
       [ OptionWithArg, "--to DEST",    "Destination location when copying files", :dest ],
     ])
+    commands.parse_command(SocksCommand, "--socks", "Start a socks proxy tunnel to the master node")
 
     commands.parse_command(LogsCommand, "--logs", "Display the step logs for the last executed step")
 
+    opts.separator "\n  Assigning Elastic IP to Master Node\n"
+
+    commands.parse_command(EipCommand, "--eip [ElasticIP]", "Associate ElasticIP to master node. If no ElasticIP is specified, allocate and associate a new one.")
+
     opts.separator "\n  Settings common to all step types\n"
 
-    commands.parse_options(["--ssh", "--scp"], [
-      [ FlagOption,   "--no-wait",    "Don't wait for the Master node to start before executing scp or ssh", :no_wait ],
+    commands.parse_options(["--ssh", "--scp", "--eip"], [
+      [ FlagOption,   "--no-wait",    "Don't wait for the Master node to start before executing scp or ssh or assigning EIP", :no_wait ],
       [ GlobalOption, "--key-pair-file FILE_PATH",   "Path to your local pem file for your EC2 key pair", :key_pair_file ], 
     ])
 
@@ -1372,15 +1911,20 @@ module Commands
 
     commands.parse_command(ListActionCommand, "--list", "List all job flows created in the last 2 days")
     commands.parse_command(DescribeActionCommand, "--describe", "Dump a JSON description of the supplied job flows")
+    commands.parse_command(PrintHiveVersionCommand, "--print-hive-version", "Prints the version of Hive that's currently active on the job flow")
     commands.parse_options(["--list", "--describe"], [
       [ OptionWithArg, "--state NAME",   "Set the name of the bootstrap action", :state ],
       [ FlagOption,    "--active",       "List running, starting or shutting down job flows", :active ],
-      [ FlagOption,    "--all",          "List all job flows in the last 2 months", :all ],
+      [ FlagOption,    "--all",          "List all job flows in the last 2 weeks", :all ],
+      [ OptionWithArg,    "--created-after=DATETIME", "List all jobflows created after DATETIME (xml date time format)", :created_after],
+      [ OptionWithArg,    "--created-before=DATETIME", "List all jobflows created before DATETIME (xml date time format)", :created_before],
       [ FlagOption,    "--no-steps",     "Do not list steps when listing jobs", :no_steps ],
     ])
     
     opts.separator "\n  Terminating Job Flows\n"
-   
+            
+    commands.parse_command(SetTerminationProtection, "--set-termination-protection BOOL", "Enable or disable job flow termination protection. Either true or false")
+
     commands.parse_command(TerminateActionCommand, "--terminate", "Terminate job flows")
 
     opts.separator "\n  Common Options\n"
@@ -1404,7 +1948,7 @@ module Commands
 
     commands.parse_options(:global, [
       [ GlobalFlagOption, "--debug",  "Print stack traces when exceptions occur", :debug],
-      [ GlobalOption,     "--endpoint ENDPOINT",  "File containing access-id and private-key", :endpoint],
+      [ GlobalOption,     "--endpoint ENDPOINT",  "EMR web service host to connect to", :endpoint],
       [ GlobalOption,     "--region REGION",  "The region to use for the endpoint", :region],
       [ GlobalOption,     "--apps-path APPS_PATH",  "Specify s3:// path to the base of the emr public bucket to use. e.g s3://us-east-1.elasticmapreduce", :apps_path],
       [ GlobalOption,     "--beta-path BETA_PATH",  "Specify s3:// path to the base of the emr public bucket to use for beta apps. e.g s3://beta.elasticmapreduce", :beta_path],
@@ -1422,9 +1966,17 @@ module Commands
 
   end
 
+  def self.is_step_command(cmd)
+    return cmd.respond_to?(:steps)
+  end
+
+  def self.is_ba_command(cmd)
+    return cmd.respond_to?(:bootstrap_actions)
+  end
+
   def self.is_create_child_command(cmd)
-    return cmd.is_a?(StepCommand) || 
-      cmd.is_a?(BootstrapActionCommand) || 
+    return is_step_command(cmd) || 
+      is_ba_command(cmd) ||
       cmd.is_a?(AddInstanceGroupCommand) ||
       cmd.is_a?(CreateInstanceGroupCommand)
   end
@@ -1438,12 +1990,12 @@ module Commands
         last_create_command = cmd
       elsif is_create_child_command(cmd) then
         if last_create_command == nil then
-          if cmd.is_a?(StepCommand) then
+          if is_step_command(cmd) then
             last_create_command = AddJobFlowStepsCommand.new(
               "--add-steps", "Add job flow steps", nil, commands
             )
             new_commands << last_create_command
-          elsif cmd.is_a?(BootstrapActionCommand) then
+          elsif is_ba_command(cmd) then
             raise RuntimeError, "the option #{cmd.name} must come after the --create option"
           elsif cmd.is_a?(CreateInstanceGroupCommand) then
             raise RuntimeError, "the option #{cmd.name} must come after the --create option"
@@ -1454,29 +2006,37 @@ module Commands
             next
           end
         end
-        
-        if cmd.is_a?(StepCommand) then
+
+        actioned = false
+        if is_step_command(cmd) then
           if ! last_create_command.respond_to?(:add_step_command) then
             last_create_command = AddJobFlowStepsCommand.new(
               "--add-steps", "Add job flow steps", nil, commands
             )
           end
           last_create_command.add_step_command(cmd)
-        elsif cmd.is_a?(BootstrapActionCommand) then
+          actioned = true
+        end
+        if is_ba_command(cmd) then 
           if ! last_create_command.respond_to?(:add_bootstrap_command) then
             raise RuntimeError, "Bootstrap actions must follow a --create command"
           end
           last_create_command.add_bootstrap_command(cmd)
-        elsif cmd.is_a?(CreateInstanceGroupCommand) || cmd.is_a?(AddInstanceGroupCommand) then
+          actioned = true
+        end
+        if cmd.is_a?(CreateInstanceGroupCommand) || cmd.is_a?(AddInstanceGroupCommand) then
           if last_create_command.respond_to?(:add_instance_group_command) then
             last_create_command.add_instance_group_command(cmd)
           else
             new_commands << cmd
           end
-        else
+          actioned = true
+        end
+
+        if ! actioned then 
           raise RuntimeError, "Unknown child command #{cmd.name} following #{last_create_command.name}"
         end
-        next
+        next 
       end
       new_commands << cmd
     end
@@ -1538,7 +2098,7 @@ module Commands
     end
 
     if commands.have(:endpoint) then
-      region_match = commands.get_field(:endpoint).match("^https*://(.*)\.elasticmapreduce") 
+      region_match = commands.get_field(:endpoint).match("^https*://(.*)\.elasticmapreduce")
       if ! commands.have(:apps_path) && region_match != nil then
         options[:apps_path] = "s3://#{region_match[1]}.elasticmapreduce"
       end

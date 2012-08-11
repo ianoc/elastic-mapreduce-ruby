@@ -1,3 +1,6 @@
+#
+# Copyright 2008-2010 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+
 require 'commands'
 require 'test/unit'
 
@@ -340,9 +343,9 @@ module Commands
       assert_equal(hive_command.args, ["s3://maps.google.com"])
       assert_equal(hive_command.steps.size, 1)
       args = hive_script_command_default_args
-      args << "s3://maps.google.com"
-      args << "--hive-versions"
-      args << "0.5"
+      args.insert(3, "--hive-versions")
+      args.insert(4, "0.5")
+      args  << "s3://maps.google.com"
       assert_equal(hadoop_jar_step_args(hive_command), args)
     end
 
@@ -362,9 +365,9 @@ module Commands
       assert_equal(hive_command.args, ["s3://maps.google.com"])
       assert_equal(hive_command.steps.size, 1)
       args = hive_script_command_default_args
+      args.insert(3, "--hive-versions")
+      args.insert(4, "0.5")
       args << "s3://maps.google.com"
-      args << "--hive-versions"
-      args << "0.5"
       assert_equal(hadoop_jar_step_args(hive_command), args)
     end
 
@@ -384,9 +387,9 @@ module Commands
       assert_equal(hive_command.args, ["s3://maps.google.com"])
       assert_equal(hive_command.steps.size, 1)
       args = hive_script_command_default_args
+      args.insert(3, "--hive-versions")
+      args.insert(4, "0.7")
       args << "s3://maps.google.com"
-      args << "--hive-versions"
-      args << "0.7"
       assert_equal(hadoop_jar_step_args(hive_command), args)
     end
 
@@ -530,13 +533,37 @@ module Commands
     end
 
     def test_ic_it
-      args = "--create --alive --enable-debugging --hive-interactive --instance-count 5 --instance-type m1.small --name MyHiveJobFlow"
+      args = "-a ACCESS_ID -p SECRET_KEY --create --alive --enable-debugging --hive-interactive --instance-count 5 --instance-type m1.small --name MyHiveJobFlow --log-uri=s3://haijun-test/logs"
       @commands = create_and_execute_commands(args)
       assert_equal(1, @commands.commands.size)
       cc = @commands.commands.first
       assert_equal("MyHiveJobFlow", cc.jobflow_name)
       assert_equal(5, cc.instance_count)
       assert_equal("m1.small", cc.instance_type)
+    end
+
+    def test_json
+      args = "-a ACCESS_ID -p SECRET_KEY --jobflow j-ABABABABA --json tests/example.json --param <bucket>=mybucket --param mybucket=yourbucket"
+      @commands = create_and_execute_commands(args)
+      assert_equal(1, @commands.commands.size)
+      cc = @commands.commands.first.step_commands.first
+      assert_equal("tests/example.json", cc.arg)
+      assert_equal({:key => "<bucket>", :value => "mybucket"}, cc.variables[0])
+      assert_equal({:key => "mybucket", :value => "yourbucket"}, cc.variables[1])
+
+      st = cc.steps.first
+
+      expected_step = {
+        "HadoopJarStep" => {
+          "Jar"  => "/home/hadoop/contrib/streaming/hadoop-0.18-streaming.jar", 
+          "Args" => ["-input", "s3n://elasticmapreduce/samples/wordcount/input", 
+                     "-output", "s3n://yourbucket/result", "-mapper", "s3://yourbucket/lib/mapper"]
+        }, 
+        "ActionOnFailure" => "CONTINUE", 
+        "Name" => "Example Step"
+      }
+
+      assert_equal(expected_step, st)
     end
 
     def test_ic_it2
@@ -553,6 +580,22 @@ module Commands
       args = "-c tests/credentials.json --instance-group core --instance-count 10"
       assert_raise RuntimeError do
         @commands = create_and_execute_commands(args)
+      end
+    end
+    
+    def test_region_from_az
+      @commands = create_and_execute_commands("-c tests/credentials.json")
+      eip_command = EipCommand.new("eip-command", "eip-command", "arg", @commands)
+      assert_equal('https://ec2.us-east-1.amazonaws.com', eip_command.ec2_endpoint_from_az('us-east-1a'))
+      assert_equal('https://ec2.ap-northeast-1.amazonaws.com', eip_command.ec2_endpoint_from_az('ec2.ap-northeast-1b'))
+      assert_equal('https://ec2.us-west-1.amazonaws.com', eip_command.ec2_endpoint_from_az('ec2.us-west-1b'))
+      assert_equal('https://ec2.us-west-2.amazonaws.com', eip_command.ec2_endpoint_from_az('ec2.us-west-2b'))
+      assert_equal('https://ec2.sa-east-1.amazonaws.com', eip_command.ec2_endpoint_from_az('ec2.sa-east-1b'))
+    end
+
+    def test_hbase_instance_types
+      assert_raise RuntimeError do
+        @commands = create_and_execute_commands("-c tests/credentials.json --create --hbase")
       end
     end
 

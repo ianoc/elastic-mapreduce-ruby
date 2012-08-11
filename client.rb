@@ -1,7 +1,9 @@
+#
+# Copyright 2008-2010 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+
 require 'credentials'
 require 'amazon/retry_delegator'
 require 'amazon/coral/elasticmapreduceclient'
-
 
 class EmrClient
   attr_accessor :commands, :logger, :options
@@ -17,7 +19,10 @@ class EmrClient
       :aws_access_key      => @options[:aws_access_id],
       :aws_secret_key      => @options[:aws_secret_key],
       :signature_algorithm => :V2,
-      :verbose             => (@options[:verbose] != nil)
+      :content_type        => 'JSON',
+      :verbose             => (@options[:verbose] != nil),
+      :connect_timeout     => 60.0,
+      :timeout             => 160.0
     }
 
     @client = Amazon::RetryDelegator.new(
@@ -78,6 +83,13 @@ class EmrClient
   def describe_jobflow(options)
     logger.trace "DescribeJobFlows(#{options.inspect})"
     result = @client.DescribeJobFlows(options.merge('DescriptionType' => 'EXTENDED'))
+    logger.trace result.inspect
+    return raise_on_error(result)
+  end
+
+  def set_termination_protection(jobflow_ids, protected)
+    logger.trace "SetTerminationProtection('JobFlowIds' => #{jobflow_ids.inspect}, 'TerminationProtected' => #{protected})"
+    result = @client.SetTerminationProtection('JobFlowIds' => jobflow_ids, 'TerminationProtected' => protected)
     logger.trace result.inspect
     return raise_on_error(result)
   end

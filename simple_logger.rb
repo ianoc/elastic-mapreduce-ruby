@@ -1,3 +1,6 @@
+#
+# Copyright 2008-2010 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
+
 class SimpleLogger
   attr_accessor :level
 
