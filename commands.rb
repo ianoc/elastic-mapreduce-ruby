@@ -1646,6 +1646,95 @@ module Commands
     end
   end
 
+  class TagCommand < Command
+    attr_accessor :no_wait, :instance_id, :key_pair_file, :jobflow_id, :jobflow_detail
+
+    CLOSED_DOWN_STATES        = Set.new(%w(TERMINATED SHUTTING_DOWN COMPLETED FAILED))
+    WAITING_OR_RUNNING_STATES = Set.new(%w(WAITING RUNNING))
+
+    def initialize(*args)
+      super(*args)
+    end
+
+    def exec(cmd)
+      commands.exec(cmd)
+    end
+
+    def wait_for_jobflow(client)
+      while true do
+        state = resolve(self.jobflow_detail, "ExecutionStatusDetail", "State")
+        if WAITING_OR_RUNNING_STATES.include?(state) then
+          break
+        elsif CLOSED_DOWN_STATES.include?(state) then
+          raise RuntimeError, "Jobflow entered #{state} while waiting to assign Elastic IP"
+        else
+          logger.info("Jobflow is in state #{state}, waiting....")
+          sleep(30)
+          self.jobflow_detail = client.describe_jobflow_with_id(jobflow_id)
+        end
+      end
+    end
+
+    def region_from_az(az)
+      md = az.match(/((\w+-)+\d+)\w+/)
+      if md then
+        md[1]
+      else
+        raise "Unable to convert Availability Zone '#{az}' to region"
+      end
+    end
+
+    def ec2_endpoint_from_az(az)
+      return "https://ec2.#{region_from_az(az)}.amazonaws.com"      
+    end
+
+    def enact(client)
+      self.jobflow_id = require_single_jobflow
+      self.jobflow_detail = client.describe_jobflow_with_id(self.jobflow_id)
+      if ! get_field(:no_wait) then
+        wait_for_jobflow(client)
+      end
+      self.instance_id = self.jobflow_detail['Instances']['MasterInstanceId']
+      if ! self.instance_id then
+        logger.error("The master instance is not available yet for jobflow #{self.jobflow_id}. It might still be starting.")
+        exit(-1)
+      end
+
+      az = self.jobflow_detail['Instances']['Placement']['AvailabilityZone']
+
+      commands.global_options[:ec2_endpoint] = ec2_endpoint_from_az(az)
+      
+      tag_pair = get_field(:arg)
+      if ! tag_pair then
+        logger.error("Tag pair arg cannot be specified without at least 1 tag")
+        exit(-1)
+      end
+      tags = {} 
+      tag_list = tag_pair.strip.split(",")
+      tag_list.each do |tag_pair_str|
+          tag_pair = tag_pair_str.split(":")
+          if tag_pair.length() != 2 then
+            logger.error("Key value pair should be specified as key:value")
+            exit(-1)
+          end
+          tags[tag_pair[0]] = tag_pair[1]
+      end
+
+      ec2_client = Ec2ClientWrapper.new(commands, logger)
+#[ianoc@ip-10-174-103-12 elastic-mapreduce]$ ruby amazon/coral/ec2client.rb -u https://ec2.amazonaws.com -o CreateTags -a AKIAIZ2ZDMGAVMDHMEAA -s "Wqow33HGrEq+CCISOMyG84H9Gp8bAq65C0+vwwgL" -v  -i "{'ResourceId.1' => 'i-43e76638', 'Tag.1.Key' => 'testTag', 'Tag.1.Value' =>'TestTagsValue'}"
+      begin
+        response = ec2_client.add_tags(self.instance_id, tags)
+        logger.info("#{tags.inspect} have been assigned to the master node of #{self.jobflow_id}")
+      rescue Exception => e
+        logger.error("Error during CreateTags: " + e.to_s)
+        if get_field(:trace) then
+          logger.puts(e.backtrace.join("\n"))
+        end
+        exit(-1)
+      end
+
+    end
+  end
   class EipCommand < Command
     attr_accessor :no_wait, :instance_id, :key_pair_file, :jobflow_id, :jobflow_detail
 
@@ -1713,7 +1802,7 @@ module Commands
         begin
           response = ec2_client.allocate_address()
         rescue Exception => e
-          logger.error("Error during AllocateAddres: " + e.message)
+          logger.error("Error during AllocateAddress: " + e.message)
           if get_field(:trace) then
             logger.puts(e.backtrace.join("\n"))
           end
@@ -1728,7 +1817,7 @@ module Commands
         response = ec2_client.associate_address(self.instance_id, eip)
         logger.info("Public IP: #{eip} was assigned to jobflow #{self.jobflow_id}")
       rescue Exception => e
-        logger.error("Error during AssociateAddres: " + e.to_s)
+        logger.error("Error during AssociateAddress: " + e.to_s)
         if get_field(:trace) then
           logger.puts(e.backtrace.join("\n"))
         end
@@ -1888,13 +1977,17 @@ module Commands
 
     commands.parse_command(LogsCommand, "--logs", "Display the step logs for the last executed step")
 
+    opts.separator "\n  Assigning Tags to Master Node\n"
+
+    commands.parse_command(TagCommand, "--tags [k1,v1,k2:v2]", "Associate Tags to master node.")
+
     opts.separator "\n  Assigning Elastic IP to Master Node\n"
 
     commands.parse_command(EipCommand, "--eip [ElasticIP]", "Associate ElasticIP to master node. If no ElasticIP is specified, allocate and associate a new one.")
 
     opts.separator "\n  Settings common to all step types\n"
 
-    commands.parse_options(["--ssh", "--scp", "--eip"], [
+    commands.parse_options(["--ssh", "--scp", "--eip", "--tags"], [
       [ FlagOption,   "--no-wait",    "Don't wait for the Master node to start before executing scp or ssh or assigning EIP", :no_wait ],
       [ GlobalOption, "--key-pair-file FILE_PATH",   "Path to your local pem file for your EC2 key pair", :key_pair_file ], 
     ])
