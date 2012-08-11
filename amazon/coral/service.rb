@@ -87,7 +87,7 @@ module Amazon
           signature_algorithm = :V1 if !args['v1'].nil?
         end
 
-        helper_args = {:endpoint => url, :signature_algorithm => signature_algorithm, :verbose => verbose, :timeout => timeout, :connect_timeout => connect_timeout}
+        helper_args = {:endpoint => url, :api_version => '2010-11-15', :signature_algorithm => signature_algorithm, :verbose => verbose, :timeout => timeout, :connect_timeout => connect_timeout}
 
         orchestrator = @orchestrator_helper_class.new_orchestrator(helper_args)
         dispatcher = Dispatcher.new(orchestrator, @service_name, operation)

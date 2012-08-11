@@ -29,6 +29,8 @@ module Amazon
       def initialize(orchestrator)
         @allocateAddressDispatcher = Dispatcher.new(orchestrator, 'Ec2', 'AllocateAddress')
         @associateAddressDispatcher = Dispatcher.new(orchestrator, 'Ec2', 'AssociateAddress')
+        @createTagsDispatcher = Dispatcher.new(orchestrator, 'Ec2', 'CreateTags')
+        @describeTagsDispatcher = Dispatcher.new(orchestrator, 'Ec2', 'DescribeTags')
       end
 
 
@@ -47,6 +49,14 @@ module Amazon
         Call.new(@allocateAddressDispatcher)
       end
 
+      def newCreateTagsCall
+        Call.new(@createTagsDispatcher)
+      end
+
+      def newDescribeTagsCall
+        Call.new(@describeTagsDispatcher)
+      end
+
       def newAssociateAddressCall
         Call.new(@associateAddressDispatcher)
       end
@@ -60,6 +70,22 @@ module Amazon
         newAllocateAddressCall.call(input)
       end
       
+      # shorthand method to invoke the createtags operation:
+      #
+      # example usage:
+      #   my_client.createtags(my_input)
+      def CreateTags(input = {})
+        newcreatetagscall.call(input)
+      end
+
+      # shorthand method to invoke the describetags operation:
+      #
+      # example usage:
+      #   my_client.describetags(my_input)
+      def DescribeTags(input = {})
+        newdescribetagscall.call(input)
+      end
+
       # Shorthand method to invoke the AssociateAddress operation:
       #
       # Example usage:
@@ -84,7 +110,9 @@ module Amazon
     # allow running from the command line
     Service.new(:service => 'Ec2', :operations => [
                                                      'AllocateAddress',
-                                                     'AssociateAddress'
+                                                     'AssociateAddress',
+                                                     'DescribeTags',
+                                                     'CreateTags'
                                                   ]).main if caller.empty?
   end
 end
